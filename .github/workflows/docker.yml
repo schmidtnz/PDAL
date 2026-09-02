@@ -17,11 +17,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.prep.outputs.VERSION }}
+      SHORT_SHA: ${{ steps.prep.outputs.SHORT_SHA }}
+      BUILD_DATE: ${{ steps.prep.outputs.BUILD_DATE }}
+    steps:
+      - name: Prepare
+        id: prep
+        run: |
+          VERSION=sha-${GITHUB_SHA::8}
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF/refs\/tags\//}
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "SHORT_SHA=${GITHUB_SHA::8}"
+            echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
+
   build_individual_images:
+    needs: prepare
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        runners: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - runners: ubuntu-24.04
+            arch: amd64
+          - runners: ubuntu-24.04-arm
+            arch: arm64
     runs-on: ${{ matrix.runners }}
     permissions:
       contents: read
@@ -75,31 +100,21 @@ jobs:
           images: |
             ghcr.io/pdal/pdal
             docker.io/pdal/pdal
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/master' }}
+            suffix=-${{ matrix.arch }},onlatest=true
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=sha-${{ needs.prepare.outputs.SHORT_SHA }},enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.BUILD_DATE }}
+          annotations: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.BUILD_DATE }}
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
-      - name: Prepare
-        id: prep
-        run: |
-          VERSION=sha-${GITHUB_SHA::8}
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF/refs\/tags\//}
-          fi
-          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          
-          runner=${{ matrix.runners }}
-          if [[ "$runner" == *"-arm" ]]; then
-            ARCH=arm64
-          else
-            ARCH=amd64
-          fi
-          echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
       - name: Build image
         uses: docker/build-push-action@v7
         id: push
@@ -108,7 +123,7 @@ jobs:
           builder: ${{ steps.buildx.outputs.name }}
           file: "./scripts/docker/ubuntu/Dockerfile"
           context: .
-          platforms: linux/${{ steps.prep.outputs.ARCH }}
+          platforms: linux/${{ matrix.arch }}
 
           # We need to pass in the SHA to the Dockerfile so it can checkout
           # our code. It is a different active SHA depending on whether it is a
@@ -116,19 +131,9 @@ jobs:
           build-args: |
             GITHUB_SHA=${{ github.event.pull_request.head.sha != '' && github.event.pull_request.head.sha || github.sha }}
             GITHUB_REPOSITORY=${{ github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name || github.repository }}
-          tags: |
-            docker.io/pdal/pdal:${{ steps.prep.outputs.VERSION }}-${{ steps.prep.outputs.ARCH }}
-            ghcr.io/pdal/pdal:${{ steps.prep.outputs.VERSION }}-${{ steps.prep.outputs.ARCH }}
-            ${{ github.ref == 'refs/heads/master' && format('docker.io/pdal/pdal:latest-{0}', steps.prep.outputs.ARCH) || '' }}
-            ${{ github.ref == 'refs/heads/master' && format('ghcr.io/pdal/pdal:latest-{0}', steps.prep.outputs.ARCH) || '' }}
-          labels: |
-            org.opencontainers.image.title=${{ github.event.repository.name }}
-            org.opencontainers.image.description=${{ github.event.repository.description }}
-            org.opencontainers.image.source=${{ github.event.repository.html_url }}
-            org.opencontainers.image.url=${{ github.event.repository.html_url }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.prep.outputs.VERSION }}
-            org.opencontainers.image.created=${{ steps.prep.outputs.BUILD_DATE }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
       
       - name: Generate artifact attestation
         if: ${{ env.PUSH_PACKAGES == 'true' }}
@@ -137,6 +142,19 @@ jobs:
           subject-name: ghcr.io/pdal/pdal
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: ${{ env.PUSH_PACKAGES == 'true' }}
+
+  verify-release-image:
+    needs: [prepare, create-manifest]
+    if: always() && github.repository_owner == 'PDAL' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the release image exists for both architectures
+        env:
+          VERSION: ${{ needs.prepare.outputs.VERSION }}
+        run: |
+          out=$(docker buildx imagetools inspect "pdal/pdal:${VERSION}")
+          echo "$out"
+          grep -q linux/amd64 <<<"$out" && grep -q linux/arm64 <<<"$out"
 
   create-manifest:
 
@@ -148,7 +166,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PUSH_PACKAGES: ${{ github.repository_owner == 'PDAL' && github.event_name != 'pull_request' }}  
-    needs: build_individual_images
+    needs: [prepare, build_individual_images]
     steps:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4.6.0
@@ -168,9 +186,20 @@ jobs:
       - name: Create and push multi-platform manifest
         if: env.PUSH_PACKAGES == 'true'
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.VERSION }}
+          SHORT_SHA: ${{ needs.prepare.outputs.SHORT_SHA }}
         run: |
           if [[ $GITHUB_REF == refs/heads/master ]]; then
+            docker buildx imagetools create \
+            -t "ghcr.io/pdal/pdal:sha-${SHORT_SHA}" \
+            "ghcr.io/pdal/pdal:sha-${SHORT_SHA}-amd64" \
+            "ghcr.io/pdal/pdal:sha-${SHORT_SHA}-arm64"
+
+            docker buildx imagetools create \
+            -t "pdal/pdal:sha-${SHORT_SHA}" \
+            "pdal/pdal:sha-${SHORT_SHA}-amd64" \
+            "pdal/pdal:sha-${SHORT_SHA}-arm64"
+
             docker buildx imagetools create \
             -t ghcr.io/pdal/pdal:latest \
             ghcr.io/pdal/pdal:latest-amd64 \
@@ -183,13 +212,15 @@ jobs:
           fi
 
           if [[ $GITHUB_REF == refs/tags/* ]]; then
-            docker buildx imagetools create \
-            -t "ghcr.io/pdal/pdal:${VERSION}" \
-            "ghcr.io/pdal/pdal:${VERSION}-amd64" \
-            "ghcr.io/pdal/pdal:${VERSION}-arm64"
+            for tag in "${VERSION}" "${VERSION%.*}"; do
+              docker buildx imagetools create \
+              -t "ghcr.io/pdal/pdal:${tag}" \
+              "ghcr.io/pdal/pdal:${tag}-amd64" \
+              "ghcr.io/pdal/pdal:${tag}-arm64"
 
-            docker buildx imagetools create \
-            -t "pdal/pdal:${VERSION}" \
-            "pdal/pdal:${VERSION}-amd64" \
-            "pdal/pdal:${VERSION}-arm64"
+              docker buildx imagetools create \
+              -t "pdal/pdal:${tag}" \
+              "pdal/pdal:${tag}-amd64" \
+              "pdal/pdal:${tag}-arm64"
+            done
           fi
